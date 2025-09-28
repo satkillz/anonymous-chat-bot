@@ -26,15 +26,15 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # === ГЛОБАЛЬНЫЕ ДАННЫЕ ===
-users = {}  # user_id -> {gender, interests, session_start_time, ...}
-search_queue = []  # список user_id в поиске
-active_sessions = {}  # user_id -> partner_id
+users = {}
+search_queue = set()  # используем set для быстрого поиска и удаления
+active_sessions = {}
 
 # === СИСТЕМА БЕЗОПАСНОСТИ ===
-user_requests = defaultdict(list)  # для rate-limiting
-user_media_count = defaultdict(list)  # медиа за последнюю минуту
-user_actions = defaultdict(list)  # для капчи
-captcha_challenges = {}  # user_id -> правильный смайлик
+user_requests = defaultdict(list)
+user_media_count = defaultdict(list)
+user_actions = defaultdict(list)
+captcha_challenges = {}
 
 # === СОСТОЯНИЯ ===
 class UserState(StatesGroup):
@@ -42,7 +42,7 @@ class UserState(StatesGroup):
     choosing_interests = State()
     in_chat = State()
     waiting_for_captcha = State()
-    in_search = State()  # новое состояние: пользователь в поиске
+    in_search = State()
 
 # === КАТЕГОРИИ ===
 CATEGORIES = ["аниме", "книги", "спорт", "школа", "депрессия", "отношения"]
@@ -101,14 +101,10 @@ def is_media_limited(user_id: int) -> bool:
 
 def check_for_captcha(user_id: int, action: str) -> bool:
     now = time.time()
-    user_actions[user_id] = [a for a in user_actions[user_id] if now - a[1] < 600]  # 10 мин
+    user_actions[user_id] = [a for a in user_actions[user_id] if now - a[1] < 600]
     user_actions[user_id].append((action, now))
-    
-    # Проверяем: 3 одинаковых действия за 10 минут
     actions = [a[0] for a in user_actions[user_id]]
-    if actions.count(action) >= 3:
-        return True
-    return False
+    return actions.count(action) >= 3
 
 def generate_captcha(user_id: int):
     emojis = ["🍎", "🚗", "😊", "🐱", "🌈", "🍕", "🚀", "⚽", "🎮", "📚"]
@@ -172,7 +168,6 @@ async def cmd_search(message: types.Message, state: FSMContext):
         await message.answer("Вы уже в поиске...", reply_markup=get_search_kb())
         return
 
-    # Проверка на капчу
     if check_for_captcha(user_id, "search"):
         correct, options = generate_captcha(user_id)
         opts_text = " ".join(options)
@@ -184,41 +179,46 @@ async def cmd_search(message: types.Message, state: FSMContext):
         await state.set_state(UserState.waiting_for_captcha)
         return
 
-    search_queue.append(user_id)
+    search_queue.add(user_id)
     await state.set_state(UserState.in_search)
     await message.answer("🔍 Начали поиск собеседника...", reply_markup=get_search_kb())
 
-    start_time = time.time()
-    while time.time() - start_time < 300:  # 5 минут
-        await asyncio.sleep(0.5)
-        for candidate in search_queue:
-            if candidate != user_id and candidate not in active_sessions:
-                if users.get(user_id, {}).get("gender") != users.get(candidate, {}).get("gender"):
-                    # Нашли пару
-                    search_queue.remove(user_id)
-                    if candidate in search_queue:
-                        search_queue.remove(candidate)
-                    active_sessions[user_id] = candidate
-                    active_sessions[candidate] = user_id
-                    users[user_id]["session_start_time"] = time.time()
-                    users[candidate]["session_start_time"] = time.time()
-                    await state.set_state(UserState.in_chat)
-                    await bot.send_message(
-                        user_id,
-                        "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
-                        reply_markup=get_chat_kb()
-                    )
-                    await bot.send_message(
-                        candidate,
-                        "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
-                        reply_markup=get_chat_kb()
-                    )
-                    return
-    # Таймаут
-    if user_id in search_queue:
-        search_queue.remove(user_id)
-    await state.clear()
-    await message.answer("❌ Не удалось найти собеседника. Попробуйте позже.", reply_markup=get_idle_kb())
+    async def _search_task():
+        start_time = time.time()
+        try:
+            while time.time() - start_time < 300:
+                await asyncio.sleep(0.5)
+                if user_id not in search_queue:
+                    return  # поиск отменён
+                for candidate in list(search_queue):
+                    if candidate != user_id and candidate not in active_sessions:
+                        if users.get(user_id, {}).get("gender") != users.get(candidate, {}).get("gender"):
+                            search_queue.discard(user_id)
+                            search_queue.discard(candidate)
+                            active_sessions[user_id] = candidate
+                            active_sessions[candidate] = user_id
+                            users[user_id]["session_start_time"] = time.time()
+                            users[candidate]["session_start_time"] = time.time()
+                            await state.set_state(UserState.in_chat)
+                            await bot.send_message(
+                                user_id,
+                                "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
+                                reply_markup=get_chat_kb()
+                            )
+                            await bot.send_message(
+                                candidate,
+                                "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
+                                reply_markup=get_chat_kb()
+                            )
+                            return
+            # Таймаут
+            if user_id in search_queue:
+                search_queue.discard(user_id)
+                await bot.send_message(user_id, "❌ Не удалось найти собеседника. Попробуйте позже.", reply_markup=get_idle_kb())
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.create_task(_search_task())
 
 @dp.message(UserState.waiting_for_captcha)
 async def handle_captcha(message: types.Message, state: FSMContext):
@@ -230,19 +230,20 @@ async def handle_captcha(message: types.Message, state: FSMContext):
         await message.answer("✅ Проверка пройдена!", reply_markup=get_idle_kb())
     else:
         await message.answer("⚠️ Подозрительная активность. Доступ ограничен на 4 часа.")
-        # Здесь можно добавить мут в БД, но для MVP просто игнорируем
         await state.clear()
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    # Прерываем поиск
-    if user_id in search_queue:
-        search_queue.remove(user_id)
+    current_state = await state.get_state()
+
+    if current_state == UserState.in_search.state:
+        if user_id in search_queue:
+            search_queue.discard(user_id)
         await state.clear()
         await message.answer("Поиск остановлен.", reply_markup=get_idle_kb())
         return
-    # Прерываем чат
+
     if user_id in active_sessions:
         partner_id = active_sessions.pop(user_id)
         active_sessions.pop(partner_id, None)
@@ -250,12 +251,12 @@ async def cmd_stop(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer("Чат завершён.", reply_markup=get_idle_kb())
         return
-    # Обычное состояние
+
     await message.answer("Вы не в поиске и не в чате.", reply_markup=get_idle_kb())
 
 @dp.message(Command("next"))
 async def cmd_next(message: types.Message, state: FSMContext):
-    await cmd_stop(message, state)  # та же логика, что и /stop для чата
+    await cmd_stop(message, state)
 
 @dp.message(Command("link"))
 async def cmd_link(message: types.Message):
@@ -269,23 +270,19 @@ async def cmd_link(message: types.Message):
     else:
         await message.answer("У вас нет username в Telegram. Установите его в настройках профиля.")
 
-# Обработка сообщений в чате
 @dp.message()
 async def handle_chat(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-
-    # Если пользователь в поиске — игнорируем
     current_state = await state.get_state()
+
     if current_state == UserState.in_search.state:
         return
 
-    # Если не в чате — показываем idle-клавиатуру
     if user_id not in active_sessions:
-        if not message.text or not message.text.startswith("/"):
+        if not (message.text and message.text.startswith("/")):
             await message.answer("Выберите действие:", reply_markup=get_idle_kb())
         return
 
-    # Проверка медиа-лимита
     if message.photo or message.video or message.voice or message.animation:
         if is_media_limited(user_id):
             await message.answer("❌ Лимит медиа: 25 файлов в минуту.")
@@ -296,7 +293,6 @@ async def handle_chat(message: types.Message, state: FSMContext):
             await message.answer("❌ Отправлять медиа можно только через 15 секунд после начала общения.")
             return
         partner_id = active_sessions[user_id]
-        # Отправка под спойлером
         if message.photo:
             await bot.send_photo(partner_id, photo=message.photo[-1].file_id, caption=message.caption, has_spoiler=True)
         elif message.video:
@@ -305,14 +301,11 @@ async def handle_chat(message: types.Message, state: FSMContext):
             await bot.send_voice(partner_id, voice=message.voice.file_id, caption=message.caption, has_spoiler=True)
         elif message.animation:
             await bot.send_animation(partner_id, animation=message.animation.file_id, caption=message.caption, has_spoiler=True)
-        # Пересылка в канал
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
     else:
-        # Текст
         partner_id = active_sessions[user_id]
         await bot.send_message(partner_id, message.text)
 
-# Запуск
 async def on_startup(bot: Bot):
     print("✅ Бот запущен!")
 
