@@ -27,9 +27,9 @@ search_queue = set()
 active_sessions = {}
 
 # === БЕЗОПАСНОСТЬ ===
-user_command_count = defaultdict(list)  # для 30 команд/мин
-user_captcha_attempts = defaultdict(int)  # неудачные попытки
-captcha_challenges = {}  # user_id -> правильный смайлик
+user_command_count = defaultdict(list)
+user_captcha_attempts = defaultdict(int)
+captcha_challenges = {}
 
 # === СОСТОЯНИЯ ===
 class UserState(StatesGroup):
@@ -49,11 +49,12 @@ def get_own_gender_kb():
     )
 
 def get_search_pref_kb():
+    # Сначала "Микс", потом остальное
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="Микс (любой)")],
             [KeyboardButton(text="Только парни")],
             [KeyboardButton(text="Только девушки")],
-            [KeyboardButton(text="Микс (любой)")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True
@@ -90,9 +91,7 @@ def get_link_confirm_kb():
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def is_banned(user_id: int) -> bool:
     banned_until = users.get(user_id, {}).get("banned_until", 0)
-    if time.time() < banned_until:
-        return True
-    return False
+    return time.time() < banned_until
 
 def get_ban_time_left(user_id: int) -> str:
     banned_until = users[user_id]["banned_until"]
@@ -123,6 +122,19 @@ def trigger_captcha(user_id: int):
 def ban_user(user_id: int, hours: int = 4):
     users.setdefault(user_id, {})["banned_until"] = time.time() + hours * 3600
 
+# === УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК /next ===
+async def handle_next(user_id: int, message: types.Message, state: FSMContext):
+    # Завершаем текущий чат, если есть
+    if user_id in active_sessions:
+        partner_id = active_sessions.pop(user_id)
+        active_sessions.pop(partner_id, None)
+        await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
+    # Убираем из поиска
+    if user_id in search_queue:
+        search_queue.discard(user_id)
+    # Начинаем новый поиск
+    await cmd_search(message, state)
+
 # === ОБРАБОТЧИКИ ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -132,10 +144,16 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
     await state.clear()
     if user_id not in users:
+        await message.answer(
+            "👋 Добро пожаловать в анонимный чат!\n\n"
+            "1️⃣ Сначала выберите **ваш пол**\n"
+            "2️⃣ Затем — **кого искать**: парня, девушку или любого собеседника\n\n"
+            "Начнём?",
+            reply_markup=get_own_gender_kb()
+        )
         await state.set_state(UserState.choosing_own_gender)
-        await message.answer("👋 Добро пожаловать!\nУкажите ваш пол:", reply_markup=get_own_gender_kb())
     else:
-        await message.answer("Вы уже зарегистрированы!", reply_markup=get_idle_kb())
+        await message.answer("Выберите действие:", reply_markup=get_idle_kb())
 
 @dp.message(UserState.choosing_own_gender)
 async def choose_own_gender(message: types.Message, state: FSMContext):
@@ -166,7 +184,7 @@ async def choose_search_pref(message: types.Message, state: FSMContext):
         return
     await state.clear()
     pref_text = {"male": "парня", "female": "девушку", "any": "собеседника"}[users[user_id]["search_preference"]]
-    await message.answer(f"✅ Готово! Теперь ищите {pref_text} через /search", reply_markup=get_idle_kb())
+    await message.answer(f"✅ Готово! Ищите {pref_text} через /search", reply_markup=get_idle_kb())
 
 @dp.message(Command("gender"))
 async def cmd_gender(message: types.Message, state: FSMContext):
@@ -176,8 +194,7 @@ async def cmd_gender(message: types.Message, state: FSMContext):
         correct, options = trigger_captcha(message.from_user.id)
         opts_text = " ".join(options)
         await message.answer(
-            f"Выберите смайлик, который вы видели в скобках: ({correct})\n"
-            f"Варианты: {opts_text}",
+            f"Выберите смайлик: ({correct})\nВарианты: {opts_text}",
             reply_markup=types.ReplyKeyboardRemove()
         )
         await state.set_state(UserState.waiting_for_captcha)
@@ -193,8 +210,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
         correct, options = trigger_captcha(message.from_user.id)
         opts_text = " ".join(options)
         await message.answer(
-            f"Выберите смайлик, который вы видели в скобках: ({correct})\n"
-            f"Варианты: {opts_text}",
+            f"Выберите смайлик: ({correct})\nВарианты: {opts_text}",
             reply_markup=types.ReplyKeyboardRemove()
         )
         await state.set_state(UserState.waiting_for_captcha)
@@ -202,7 +218,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
 
     user_id = message.from_user.id
     if user_id not in users:
-        await message.answer("Сначала пройдите регистрацию через /start")
+        await message.answer("Сначала укажите ваш пол через /start")
         return
     if user_id in active_sessions:
         await message.answer("Вы уже в чате!", reply_markup=get_chat_kb())
@@ -272,7 +288,7 @@ async def handle_captcha(message: types.Message, state: FSMContext):
     if correct and message.text.strip() == correct:
         del captcha_challenges[user_id]
         user_captcha_attempts[user_id] = 0
-        user_command_count[user_id] = []  # сброс счётчика
+        user_command_count[user_id] = []
         await state.clear()
         await message.answer("✅ Проверка пройдена!", reply_markup=get_idle_kb())
     else:
@@ -295,25 +311,20 @@ async def cmd_stop(message: types.Message, state: FSMContext):
     if is_banned(message.from_user.id):
         return
     user_id = message.from_user.id
-    current_state = await state.get_state()
-    if current_state == UserState.in_search.state:
-        if user_id in search_queue:
-            search_queue.discard(user_id)
-        await state.clear()
-        await message.answer("Поиск остановлен.", reply_markup=get_idle_kb())
-        return
     if user_id in active_sessions:
         partner_id = active_sessions.pop(user_id)
         active_sessions.pop(partner_id, None)
-        await bot.send_message(partner_id, "Ваш собеседник покинул чат.", reply_markup=get_idle_kb())
-        await state.clear()
-        await message.answer("Чат завершён.", reply_markup=get_idle_kb())
-        return
-    await message.answer("Вы не в поиске и не в чате.", reply_markup=get_idle_kb())
+        await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
+    if user_id in search_queue:
+        search_queue.discard(user_id)
+    await state.clear()
+    await message.answer("Поиск остановлен.", reply_markup=get_idle_kb())
 
 @dp.message(Command("next"))
 async def cmd_next(message: types.Message, state: FSMContext):
-    await cmd_stop(message, state)
+    if is_banned(message.from_user.id):
+        return
+    await handle_next(message.from_user.id, message, state)
 
 @dp.message(Command("link"))
 async def cmd_link(message: types.Message, state: FSMContext):
@@ -331,7 +342,6 @@ async def handle_link_confirm(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "link_confirm_yes":
         if callback.from_user.username:
             partner_id = active_sessions[user_id]
-            # Отправляем как ТЕКСТ с гиперссылкой (нельзя переслать как forward)
             await bot.send_message(
                 partner_id,
                 f"👤 Собеседник поделился профилем: [@{callback.from_user.username}](https://t.me/{callback.from_user.username})",
@@ -360,39 +370,19 @@ async def handle_chat(message: types.Message, state: FSMContext):
             await message.answer("Выберите действие:", reply_markup=get_idle_kb())
         return
 
-    # ЗАПРЕТ НА ПЕРЕСЫЛКУ: отправляем как НОВОЕ сообщение
+    # Запрет пересылки — отправляем как новые сообщения
     if message.photo:
-        await bot.send_photo(
-            active_sessions[user_id],
-            photo=message.photo[-1].file_id,
-            caption=message.caption,
-            has_spoiler=True
-        )
+        await bot.send_photo(active_sessions[user_id], photo=message.photo[-1].file_id, caption=message.caption, has_spoiler=True)
     elif message.video:
-        await bot.send_video(
-            active_sessions[user_id],
-            video=message.video.file_id,
-            caption=message.caption,
-            has_spoiler=True
-        )
+        await bot.send_video(active_sessions[user_id], video=message.video.file_id, caption=message.caption, has_spoiler=True)
     elif message.voice:
-        await bot.send_voice(
-            active_sessions[user_id],
-            voice=message.voice.file_id,
-            caption=message.caption,
-            has_spoiler=True
-        )
+        await bot.send_voice(active_sessions[user_id], voice=message.voice.file_id, caption=message.caption, has_spoiler=True)
     elif message.animation:
-        await bot.send_animation(
-            active_sessions[user_id],
-            animation=message.animation.file_id,
-            caption=message.caption,
-            has_spoiler=True
-        )
+        await bot.send_animation(active_sessions[user_id], animation=message.animation.file_id, caption=message.caption, has_spoiler=True)
     else:
         await bot.send_message(active_sessions[user_id], message.text)
 
-    # Пересылка в канал (можно как forward, т.к. это модерация)
+    # Пересылка медиа в канал
     if message.photo or message.video or message.voice or message.animation:
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
 
