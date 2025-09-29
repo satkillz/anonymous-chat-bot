@@ -21,11 +21,12 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# === ГЛОБАЛЬНЫЕ ДАННЫЕ ===
+# === ДАННЫЕ ===
+users = {}  # user_id -> {own_gender, search_preference}
 search_queue = set()
 active_sessions = {}
 
-# === СИСТЕМА БЕЗОПАСНОСТИ ===
+# === БЕЗОПАСНОСТЬ ===
 user_requests = defaultdict(list)
 user_media_count = defaultdict(list)
 user_actions = defaultdict(list)
@@ -33,11 +34,31 @@ captcha_challenges = {}
 
 # === СОСТОЯНИЯ ===
 class UserState(StatesGroup):
+    choosing_own_gender = State()
+    choosing_search_pref = State()
     in_chat = State()
     waiting_for_captcha = State()
     in_search = State()
 
 # === КЛАВИАТУРЫ ===
+def get_own_gender_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Мужчина"), KeyboardButton(text="Женщина")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def get_search_pref_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Только парни")],
+            [KeyboardButton(text="Только девушки")],
+            [KeyboardButton(text="Микс (любой)")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
 def get_search_kb():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="/stop")]],
@@ -55,7 +76,7 @@ def get_chat_kb():
 def get_idle_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="/search"), KeyboardButton(text="/interes")]
+            [KeyboardButton(text="/search"), KeyboardButton(text="/gender")]
         ],
         resize_keyboard=True
     )
@@ -92,21 +113,59 @@ def generate_captcha(user_id: int):
     random.shuffle(options)
     return correct, options
 
+def get_search_text(preference: str) -> str:
+    if preference == "male":
+        return "парня"
+    elif preference == "female":
+        return "девушку"
+    else:
+        return "собеседника"
+
 # === ОБРАБОТЧИКИ ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "Добро пожаловать в анонимный чат!\nНачните общение:",
-        reply_markup=get_idle_kb()
-    )
+    user_id = message.from_user.id
+    if user_id not in users:
+        await state.set_state(UserState.choosing_own_gender)
+        await message.answer("👋 Добро пожаловать!\nУкажите ваш пол:", reply_markup=get_own_gender_kb())
+    else:
+        await message.answer("Вы уже зарегистрированы!", reply_markup=get_idle_kb())
 
-@dp.message(Command("interes"))
-async def cmd_interes(message: types.Message, state: FSMContext):
+@dp.message(UserState.choosing_own_gender)
+async def choose_own_gender(message: types.Message, state: FSMContext):
+    if message.text not in ["Мужчина", "Женщина"]:
+        await message.answer("Пожалуйста, выберите из кнопок.")
+        return
+    own_gender = "male" if message.text == "Мужчина" else "female"
+    users[message.from_user.id] = {"own_gender": own_gender}
+    await state.set_state(UserState.choosing_search_pref)
+    await message.answer("Кого вы хотите найти?", reply_markup=get_search_pref_kb())
+
+@dp.message(UserState.choosing_search_pref)
+async def choose_search_pref(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text
+    if text == "Только парни":
+        users[user_id]["search_preference"] = "male"
+    elif text == "Только девушки":
+        users[user_id]["search_preference"] = "female"
+    elif text == "Микс (любой)":
+        users[user_id]["search_preference"] = "any"
+    else:
+        await message.answer("Пожалуйста, выберите из кнопок.")
+        return
+    await state.clear()
+    pref_text = get_search_text(users[user_id]["search_preference"])
+    await message.answer(f"✅ Готово! Теперь ищите {pref_text} через /search", reply_markup=get_idle_kb())
+
+@dp.message(Command("gender"))
+async def cmd_gender(message: types.Message, state: FSMContext):
     if is_rate_limited(message.from_user.id):
         await message.answer("❌ Слишком много запросов. Подождите 1 минуту.")
         return
-    await message.answer("Функция временно недоступна.", reply_markup=get_idle_kb())
+    await state.set_state(UserState.choosing_search_pref)
+    await message.answer("Измените предпочтения поиска:", reply_markup=get_search_pref_kb())
 
 @dp.message(Command("search"))
 async def cmd_search(message: types.Message, state: FSMContext):
@@ -115,6 +174,9 @@ async def cmd_search(message: types.Message, state: FSMContext):
         return
 
     user_id = message.from_user.id
+    if user_id not in users:
+        await message.answer("Сначала пройдите регистрацию через /start")
+        return
     if user_id in active_sessions:
         await message.answer("Вы уже в чате!", reply_markup=get_chat_kb())
         return
@@ -135,18 +197,32 @@ async def cmd_search(message: types.Message, state: FSMContext):
 
     search_queue.add(user_id)
     await state.set_state(UserState.in_search)
-    await message.answer("🔍 Начали поиск собеседника...", reply_markup=get_search_kb())
+    pref = users[user_id]["search_preference"]
+    target_text = get_search_text(pref)
+    await message.answer(f"Начат поиск 🙏, ищем 🔎 {target_text}...", reply_markup=get_search_kb())
+
+    start_time = time.time()
+    warned = False
 
     async def _search_task():
-        start_time = time.time()
+        nonlocal warned
         try:
-            while time.time() - start_time < 300:  # 5 минут
+            while time.time() - start_time < 300:  # 5 минут максимум
                 await asyncio.sleep(0.5)
                 if user_id not in search_queue:
-                    return  # поиск отменён
+                    return
+
+                pref = users[user_id]["search_preference"]
                 for candidate in list(search_queue):
-                    if candidate != user_id and candidate not in active_sessions:
-                        # Подключаем ЛЮБОГО активного пользователя (без фильтра по полу)
+                    if candidate == user_id or candidate in active_sessions:
+                        continue
+                    # Проверка по предпочтениям
+                    if pref == "any":
+                        match = True
+                    else:
+                        match = users.get(candidate, {}).get("own_gender") == pref
+
+                    if match:
                         search_queue.discard(user_id)
                         search_queue.discard(candidate)
                         active_sessions[user_id] = candidate
@@ -163,6 +239,17 @@ async def cmd_search(message: types.Message, state: FSMContext):
                             reply_markup=get_chat_kb()
                         )
                         return
+
+                # Через 2 минуты без совпадения — предложить микс
+                if not warned and time.time() - start_time > 120 and pref in ("male", "female"):
+                    warned = True
+                    await bot.send_message(
+                        user_id,
+                        "⚠️ Долго не удаётся найти собеседника нужного пола.\n"
+                        "Хотите переключиться на поиск любого собеседника (микс)?\n"
+                        "Используйте /gender, чтобы изменить настройки.",
+                        reply_markup=get_idle_kb()
+                    )
             # Таймаут
             if user_id in search_queue:
                 search_queue.discard(user_id)
@@ -239,7 +326,6 @@ async def handle_chat(message: types.Message, state: FSMContext):
         if is_media_limited(user_id):
             await message.answer("❌ Лимит медиа: 25 файлов в минуту.")
             return
-        # Нет привязки к времени сессии — медиа можно сразу
         partner_id = active_sessions[user_id]
         if message.photo:
             await bot.send_photo(partner_id, photo=message.photo[-1].file_id, caption=message.caption, has_spoiler=True)
