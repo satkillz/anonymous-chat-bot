@@ -312,16 +312,19 @@ async def cmd_link(message: types.Message):
 @dp.message()
 async def handle_chat(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    current_state = await state.get_state()
 
-    if current_state == UserState.in_search.state:
+    # Если пользователь в поиске — игнорируем (но лучше не попадать сюда)
+    if user_id in search_queue:
+        await message.answer("Вы в поиске собеседника. Подождите...", reply_markup=get_search_kb())
         return
 
+    # Если не в активной сессии — показываем idle
     if user_id not in active_sessions:
         if not (message.text and message.text.startswith("/")):
             await message.answer("Выберите действие:", reply_markup=get_idle_kb())
         return
 
+    # Проверка медиа
     if message.photo or message.video or message.voice or message.animation:
         if is_media_limited(user_id):
             await message.answer("❌ Лимит медиа: 25 файлов в минуту.")
@@ -337,9 +340,9 @@ async def handle_chat(message: types.Message, state: FSMContext):
             await bot.send_animation(partner_id, animation=message.animation.file_id, caption=message.caption, has_spoiler=True)
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
     else:
+        # Текстовое сообщение
         partner_id = active_sessions[user_id]
         await bot.send_message(partner_id, message.text)
-
 async def on_startup(bot: Bot):
     print("✅ Бот запущен!")
 
