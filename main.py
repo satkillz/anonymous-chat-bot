@@ -12,22 +12,17 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 import os
 
-# Загружаем .env
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("MODERATION_CHANNEL_ID"))
 
-# Включаем логирование
 logging.basicConfig(level=logging.INFO)
-
-# Инициализация
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # === ГЛОБАЛЬНЫЕ ДАННЫЕ ===
-users = {}
-search_queue = set()  # используем set для быстрого поиска и удаления
+search_queue = set()
 active_sessions = {}
 
 # === СИСТЕМА БЕЗОПАСНОСТИ ===
@@ -38,28 +33,11 @@ captcha_challenges = {}
 
 # === СОСТОЯНИЯ ===
 class UserState(StatesGroup):
-    choosing_gender = State()
-    choosing_interests = State()
     in_chat = State()
     waiting_for_captcha = State()
     in_search = State()
 
-# === КАТЕГОРИИ ===
-CATEGORIES = ["аниме", "книги", "спорт", "школа", "депрессия", "отношения"]
-
 # === КЛАВИАТУРЫ ===
-def get_gender_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Мужской"), KeyboardButton(text="Женский")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-
-def get_interests_kb():
-    buttons = [[KeyboardButton(text=cat)] for cat in CATEGORIES]
-    buttons.append([KeyboardButton(text="Пропустить")])
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
-
 def get_search_kb():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="/stop")]],
@@ -118,41 +96,17 @@ def generate_captcha(user_id: int):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    if user_id not in users:
-        await state.set_state(UserState.choosing_gender)
-        await message.answer("Добро пожаловать! Выберите ваш пол:", reply_markup=get_gender_kb())
-    else:
-        await message.answer("Вы уже зарегистрированы!", reply_markup=get_idle_kb())
-
-@dp.message(UserState.choosing_gender)
-async def choose_gender(message: types.Message, state: FSMContext):
-    if message.text not in ["Мужской", "Женский"]:
-        await message.answer("Пожалуйста, выберите пол из кнопок.")
-        return
-    users[message.from_user.id] = {
-        "gender": "male" if message.text == "Мужской" else "female",
-        "interests": [],
-        "session_start_time": None
-    }
-    await state.set_state(UserState.choosing_interests)
-    await message.answer("Выберите категорию общения:", reply_markup=get_interests_kb())
-
-@dp.message(UserState.choosing_interests)
-async def choose_interests(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if message.text in CATEGORIES:
-        users[user_id]["interests"] = [message.text]
-    await state.clear()
-    await message.answer("Готово! Используйте кнопки ниже:", reply_markup=get_idle_kb())
+    await message.answer(
+        "Добро пожаловать в анонимный чат!\nНачните общение:",
+        reply_markup=get_idle_kb()
+    )
 
 @dp.message(Command("interes"))
 async def cmd_interes(message: types.Message, state: FSMContext):
     if is_rate_limited(message.from_user.id):
         await message.answer("❌ Слишком много запросов. Подождите 1 минуту.")
         return
-    await state.set_state(UserState.choosing_interests)
-    await message.answer("Выберите категорию общения:", reply_markup=get_interests_kb())
+    await message.answer("Функция временно недоступна.", reply_markup=get_idle_kb())
 
 @dp.message(Command("search"))
 async def cmd_search(message: types.Message, state: FSMContext):
@@ -186,31 +140,29 @@ async def cmd_search(message: types.Message, state: FSMContext):
     async def _search_task():
         start_time = time.time()
         try:
-            while time.time() - start_time < 300:
+            while time.time() - start_time < 300:  # 5 минут
                 await asyncio.sleep(0.5)
                 if user_id not in search_queue:
                     return  # поиск отменён
                 for candidate in list(search_queue):
                     if candidate != user_id and candidate not in active_sessions:
-                        if users.get(user_id, {}).get("gender") != users.get(candidate, {}).get("gender"):
-                            search_queue.discard(user_id)
-                            search_queue.discard(candidate)
-                            active_sessions[user_id] = candidate
-                            active_sessions[candidate] = user_id
-                            users[user_id]["session_start_time"] = time.time()
-                            users[candidate]["session_start_time"] = time.time()
-                            await state.set_state(UserState.in_chat)
-                            await bot.send_message(
-                                user_id,
-                                "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
-                                reply_markup=get_chat_kb()
-                            )
-                            await bot.send_message(
-                                candidate,
-                                "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
-                                reply_markup=get_chat_kb()
-                            )
-                            return
+                        # Подключаем ЛЮБОГО активного пользователя (без фильтра по полу)
+                        search_queue.discard(user_id)
+                        search_queue.discard(candidate)
+                        active_sessions[user_id] = candidate
+                        active_sessions[candidate] = user_id
+                        await state.set_state(UserState.in_chat)
+                        await bot.send_message(
+                            user_id,
+                            "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
+                            reply_markup=get_chat_kb()
+                        )
+                        await bot.send_message(
+                            candidate,
+                            "✅ Собеседник найден, хорошего общения🫶🏻\n/next - следующий собеседник\n/stop - остановить диалог",
+                            reply_markup=get_chat_kb()
+                        )
+                        return
             # Таймаут
             if user_id in search_queue:
                 search_queue.discard(user_id)
@@ -287,11 +239,7 @@ async def handle_chat(message: types.Message, state: FSMContext):
         if is_media_limited(user_id):
             await message.answer("❌ Лимит медиа: 25 файлов в минуту.")
             return
-        current_time = time.time()
-        session_start = users[user_id]["session_start_time"]
-        if current_time - session_start < 15:
-            await message.answer("❌ Отправлять медиа можно только через 15 секунд после начала общения.")
-            return
+        # Нет привязки к времени сессии — медиа можно сразу
         partner_id = active_sessions[user_id]
         if message.photo:
             await bot.send_photo(partner_id, photo=message.photo[-1].file_id, caption=message.caption, has_spoiler=True)
