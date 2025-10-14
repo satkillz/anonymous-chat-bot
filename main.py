@@ -443,12 +443,24 @@ async def handle_chat(message: types.Message, state: FSMContext):
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
 
 async def on_startup(bot: Bot):
-    await init_db()
-    print("✅ Бот и PostgreSQL готовы!")
+    try:
+        print("🔧 DATABASE_URL:", os.getenv("DATABASE_URL", "NOT SET"))
+        await init_db()
+        print("✅ Бот и PostgreSQL готовы!")
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        import traceback
+        traceback.print_exc()
+        raise  # чтобы Railway остановил деплой и показал ошибку
 
 async def main():
-    dp.startup.register(on_startup)
-    await dp.start_polling(bot)
+    try:
+        dp.startup.register(on_startup)
+        await dp.start_polling(bot)
+    except Exception as e:
+        print(f"💥 ОШИБКА В ГЛАВНОМ ЦИКЛЕ: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())
