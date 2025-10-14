@@ -11,25 +11,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import os
+import asyncpg
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("MODERATION_CHANNEL_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-# === ДАННЫЕ ===
-users = {}  # user_id -> {own_gender, search_preference, banned_until}
-search_queue = set()
-active_sessions = {}
-
-# === БЕЗОПАСНОСТЬ ===
-user_command_count = defaultdict(list)
-user_captcha_attempts = defaultdict(int)
-captcha_challenges = {}
 
 # === СОСТОЯНИЯ ===
 class UserState(StatesGroup):
@@ -49,7 +41,6 @@ def get_own_gender_kb():
     )
 
 def get_search_pref_kb():
-    # Сначала "Микс", потом остальное
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Микс (любой)")],
@@ -88,21 +79,76 @@ def get_link_confirm_kb():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="link_confirm_no")]
     ])
 
+# === БЕЗОПАСНОСТЬ ===
+user_command_count = defaultdict(list)
+user_captcha_attempts = defaultdict(int)
+captcha_challenges = {}
+
+# === ФУНКЦИИ РАБОТЫ С БД ===
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            own_gender TEXT,
+            search_preference TEXT,
+            banned_until DOUBLE PRECISION DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS bans (
+            user_id BIGINT PRIMARY KEY,
+            expires_at DOUBLE PRECISION
+        );
+    """)
+    await conn.close()
+
+async def get_user_from_db(user_id: int):
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+    await conn.close()
+    return row
+
+async def save_user_to_db(user_id: int, own_gender: str, search_preference: str, banned_until: float = 0):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        INSERT INTO users (user_id, own_gender, search_preference, banned_until)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id) DO UPDATE
+        SET own_gender = $2, search_preference = $3, banned_until = $4
+    """, user_id, own_gender, search_preference, banned_until)
+    await conn.close()
+
+async def get_ban_from_db(user_id: int):
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT expires_at FROM bans WHERE user_id = $1", user_id)
+    await conn.close()
+    return row["expires_at"] if row else 0
+
+async def ban_user_in_db(user_id: int, hours: int = 4):
+    expires = time.time() + hours * 3600
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        INSERT INTO bans (user_id, expires_at)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id) DO UPDATE
+        SET expires_at = $2
+    """, user_id, expires)
+    # Также обновим users
+    user = await get_user_from_db(user_id)
+    if user:
+        await save_user_to_db(user_id, user["own_gender"], user["search_preference"], expires)
+    await conn.close()
+
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
-def is_banned(user_id: int) -> bool:
-    banned_until = users.get(user_id, {}).get("banned_until", 0)
+def is_banned(banned_until: float) -> bool:
     return time.time() < banned_until
 
-def get_ban_time_left(user_id: int) -> str:
-    banned_until = users[user_id]["banned_until"]
+def get_ban_time_left(banned_until: float) -> str:
     seconds = int(banned_until - time.time())
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
     return f"{hours}ч {minutes}мин"
 
 def is_rate_limited(user_id: int) -> bool:
-    if is_banned(user_id):
-        return True
     now = time.time()
     user_command_count[user_id] = [t for t in user_command_count[user_id] if now - t < 60]
     if len(user_command_count[user_id]) >= 30:
@@ -119,31 +165,22 @@ def trigger_captcha(user_id: int):
     random.shuffle(options)
     return correct, options
 
-def ban_user(user_id: int, hours: int = 4):
-    users.setdefault(user_id, {})["banned_until"] = time.time() + hours * 3600
-
-# === УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК /next ===
-async def handle_next(user_id: int, message: types.Message, state: FSMContext):
-    # Завершаем текущий чат, если есть
-    if user_id in active_sessions:
-        partner_id = active_sessions.pop(user_id)
-        active_sessions.pop(partner_id, None)
-        await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
-    # Убираем из поиска
-    if user_id in search_queue:
-        search_queue.discard(user_id)
-    # Начинаем новый поиск
-    await cmd_search(message, state)
+# === ГЛОБАЛЬНЫЕ ДАННЫЕ (временно для сессий) ===
+search_queue = set()
+active_sessions = {}
 
 # === ОБРАБОТЧИКИ ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    if is_banned(user_id):
-        await message.answer(f"⚠️ Вы забанены. Осталось: {get_ban_time_left(user_id)}")
+    # Проверка бана из БД
+    banned_until = await get_ban_from_db(user_id)
+    if is_banned(banned_until):
+        await message.answer(f"⚠️ Вы забанены. Осталось: {get_ban_time_left(banned_until)}")
         return
     await state.clear()
-    if user_id not in users:
+    user_data = await get_user_from_db(user_id)
+    if not user_
         await message.answer(
             "👋 Добро пожаловать в анонимный чат!\n\n"
             "1️⃣ Сначала выберите **ваш пол**\n"
@@ -153,45 +190,50 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(UserState.choosing_own_gender)
     else:
+        # Загружаем данные в память для сессии
+        active_sessions  # не используется здесь, но данные есть
         await message.answer("Выберите действие:", reply_markup=get_idle_kb())
 
 @dp.message(UserState.choosing_own_gender)
 async def choose_own_gender(message: types.Message, state: FSMContext):
-    if is_banned(message.from_user.id):
-        return
     if message.text not in ["Мужчина", "Женщина"]:
         await message.answer("Пожалуйста, выберите из кнопок.")
         return
     own_gender = "male" if message.text == "Мужчина" else "female"
-    users[message.from_user.id] = {"own_gender": own_gender}
+    users_data = {"own_gender": own_gender}
+    await state.update_data(temp_user=users_data)
     await state.set_state(UserState.choosing_search_pref)
     await message.answer("Кого вы хотите найти?", reply_markup=get_search_pref_kb())
 
 @dp.message(UserState.choosing_search_pref)
 async def choose_search_pref(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    if is_banned(user_id):
-        return
     text = message.text
     if text == "Только парни":
-        users[user_id]["search_preference"] = "male"
+        pref = "male"
     elif text == "Только девушки":
-        users[user_id]["search_preference"] = "female"
+        pref = "female"
     elif text == "Микс (любой)":
-        users[user_id]["search_preference"] = "any"
+        pref = "any"
     else:
         await message.answer("Пожалуйста, выберите из кнопок.")
         return
+    data = await state.get_data()
+    own_gender = data["temp_user"]["own_gender"]
+    await save_user_to_db(user_id, own_gender, pref)
     await state.clear()
-    pref_text = {"male": "парня", "female": "девушку", "any": "собеседника"}[users[user_id]["search_preference"]]
-    await message.answer(f"✅ Готово! Ищите {pref_text} через /search", reply_markup=get_idle_kb())
+    target = {"male": "парня", "female": "девушку", "any": "собеседника"}[pref]
+    await message.answer(f"✅ Готово! Ищите {target} через /search", reply_markup=get_idle_kb())
 
 @dp.message(Command("gender"))
 async def cmd_gender(message: types.Message, state: FSMContext):
-    if is_banned(message.from_user.id):
+    user_id = message.from_user.id
+    banned_until = await get_ban_from_db(user_id)
+    if is_banned(banned_until):
+        await message.answer(f"⚠️ Вы забанены. Осталось: {get_ban_time_left(banned_until)}")
         return
-    if is_rate_limited(message.from_user.id):
-        correct, options = trigger_captcha(message.from_user.id)
+    if is_rate_limited(user_id):
+        correct, options = trigger_captcha(user_id)
         opts_text = " ".join(options)
         await message.answer(
             f"Выберите смайлик: ({correct})\nВарианты: {opts_text}",
@@ -204,10 +246,13 @@ async def cmd_gender(message: types.Message, state: FSMContext):
 
 @dp.message(Command("search"))
 async def cmd_search(message: types.Message, state: FSMContext):
-    if is_banned(message.from_user.id):
+    user_id = message.from_user.id
+    banned_until = await get_ban_from_db(user_id)
+    if is_banned(banned_until):
+        await message.answer(f"⚠️ Вы забанены. Осталось: {get_ban_time_left(banned_until)}")
         return
-    if is_rate_limited(message.from_user.id):
-        correct, options = trigger_captcha(message.from_user.id)
+    if is_rate_limited(user_id):
+        correct, options = trigger_captcha(user_id)
         opts_text = " ".join(options)
         await message.answer(
             f"Выберите смайлик: ({correct})\nВарианты: {opts_text}",
@@ -216,8 +261,8 @@ async def cmd_search(message: types.Message, state: FSMContext):
         await state.set_state(UserState.waiting_for_captcha)
         return
 
-    user_id = message.from_user.id
-    if user_id not in users:
+    user_data = await get_user_from_db(user_id)
+    if not user_
         await message.answer("Сначала укажите ваш пол через /start")
         return
     if user_id in active_sessions:
@@ -229,9 +274,9 @@ async def cmd_search(message: types.Message, state: FSMContext):
 
     search_queue.add(user_id)
     await state.set_state(UserState.in_search)
-    pref = users[user_id]["search_preference"]
-    target_text = {"male": "парня", "female": "девушку", "any": "собеседника"}[pref]
-    await message.answer(f"Начат поиск 🙏, ищем 🔎 {target_text}...", reply_markup=get_search_kb())
+    pref = user_data["search_preference"]
+    target = {"male": "парня", "female": "девушку", "any": "собеседника"}[pref]
+    await message.answer(f"Начат поиск 🙏, ищем 🔎 {target}...", reply_markup=get_search_kb())
 
     start_time = time.time()
     warned = False
@@ -243,11 +288,17 @@ async def cmd_search(message: types.Message, state: FSMContext):
                 await asyncio.sleep(0.5)
                 if user_id not in search_queue:
                     return
-                pref = users[user_id]["search_preference"]
+                user_data = await get_user_from_db(user_id)
+                if not user_
+                    return
+                pref = user_data["search_preference"]
                 for candidate in list(search_queue):
                     if candidate == user_id or candidate in active_sessions:
                         continue
-                    if pref == "any" or users.get(candidate, {}).get("own_gender") == pref:
+                    candidate_data = await get_user_from_db(candidate)
+                    if not candidate_
+                        continue
+                    if pref == "any" or candidate_data["own_gender"] == pref:
                         search_queue.discard(user_id)
                         search_queue.discard(candidate)
                         active_sessions[user_id] = candidate
@@ -294,8 +345,9 @@ async def handle_captcha(message: types.Message, state: FSMContext):
     else:
         user_captcha_attempts[user_id] += 1
         if user_captcha_attempts[user_id] >= 3:
-            ban_user(user_id, 4)
-            await message.answer(f"⚠️ Доступ заблокирован на 4 часа. Осталось: {get_ban_time_left(user_id)}")
+            await ban_user_in_db(user_id, 4)
+            banned_until = await get_ban_from_db(user_id)
+            await message.answer(f"⚠️ Доступ заблокирован на 4 часа. Осталось: {get_ban_time_left(banned_until)}")
             await state.clear()
         else:
             correct, options = trigger_captcha(user_id)
@@ -308,8 +360,6 @@ async def handle_captcha(message: types.Message, state: FSMContext):
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message, state: FSMContext):
-    if is_banned(message.from_user.id):
-        return
     user_id = message.from_user.id
     if user_id in active_sessions:
         partner_id = active_sessions.pop(user_id)
@@ -322,15 +372,20 @@ async def cmd_stop(message: types.Message, state: FSMContext):
 
 @dp.message(Command("next"))
 async def cmd_next(message: types.Message, state: FSMContext):
-    if is_banned(message.from_user.id):
-        return
-    await handle_next(message.from_user.id, message, state)
+    user_id = message.from_user.id
+    if user_id in active_sessions:
+        partner_id = active_sessions.pop(user_id)
+        active_sessions.pop(partner_id, None)
+        await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
+    if user_id in search_queue:
+        search_queue.discard(user_id)
+    # Начинаем новый поиск
+    await cmd_search(message, state)
 
 @dp.message(Command("link"))
 async def cmd_link(message: types.Message, state: FSMContext):
-    if is_banned(message.from_user.id):
-        return
-    if message.from_user.id not in active_sessions:
+    user_id = message.from_user.id
+    if user_id not in active_sessions:
         await message.answer("Вы не в чате.")
         return
     await state.set_state(UserState.confirming_link)
@@ -358,7 +413,8 @@ async def handle_link_confirm(callback: types.CallbackQuery, state: FSMContext):
 @dp.message()
 async def handle_chat(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    if is_banned(user_id):
+    banned_until = await get_ban_from_db(user_id)
+    if is_banned(banned_until):
         return
 
     if user_id in search_queue:
@@ -387,7 +443,8 @@ async def handle_chat(message: types.Message, state: FSMContext):
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
 
 async def on_startup(bot: Bot):
-    print("✅ Бот запущен!")
+    await init_db()
+    print("✅ Бот и PostgreSQL готовы!")
 
 async def main():
     dp.startup.register(on_startup)
