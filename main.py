@@ -139,7 +139,6 @@ async def ban_user_in_db(user_id: int, hours: int = 4):
         ON CONFLICT (user_id) DO UPDATE
         SET expires_at = $2
     """, user_id, expires)
-    # Обновим и users
     user = await get_user_from_db(user_id)
     if user:
         await save_user_to_db(user_id, user["own_gender"], user["search_preference"], expires)
@@ -182,7 +181,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
     await state.clear()
     user_data = await get_user_from_db(user_id)
-    if not user_
+    if not user_  # ✅ ИСПРАВЛЕНО: user_data + двоеточие
         await message.answer(
             "👋 Добро пожаловать в анонимный чат!\n\n"
             "1️⃣ Сначала выберите **ваш пол**\n"
@@ -261,7 +260,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
         return
 
     user_data = await get_user_from_db(user_id)
-    if not user_
+    if not user_:  # ✅ ИСПРАВЛЕНО
         await message.answer("Сначала укажите ваш пол через /start")
         return
     if user_id in active_sessions:
@@ -288,14 +287,14 @@ async def cmd_search(message: types.Message, state: FSMContext):
                 if user_id not in search_queue:
                     return
                 user_data = await get_user_from_db(user_id)
-                if not user_
+                if not user_:  # ✅ ИСПРАВЛЕНО
                     return
                 pref = user_data["search_preference"]
                 for candidate in list(search_queue):
                     if candidate == user_id or candidate in active_sessions:
                         continue
                     candidate_data = await get_user_from_db(candidate)
-                    if not candidate_
+                    if not candidate_:  # ✅ ИСПРАВЛЕНО
                         continue
                     if pref == "any" or candidate_data["own_gender"] == pref:
                         search_queue.discard(user_id)
@@ -439,9 +438,9 @@ async def handle_chat(message: types.Message, state: FSMContext):
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
 
 async def on_startup(bot: Bot):
-    print("🔧 DATABASE_URL:", DATABASE_URL[:20] + "..." if DATABASE_URL else "NOT SET")
+    print("✅ Инициализация PostgreSQL...")
     await init_db()
-    print("✅ Бот и PostgreSQL успешно запущены!")
+    print("✅ Бот и БД готовы к работе!")
 
 async def main():
     dp.startup.register(on_startup)
