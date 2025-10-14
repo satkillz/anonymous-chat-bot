@@ -19,6 +19,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("MODERATION_CHANNEL_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not BOT_TOKEN or not DATABASE_URL:
+    raise ValueError("❌ BOT_TOKEN или DATABASE_URL не заданы!")
+
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -79,6 +82,10 @@ def get_link_confirm_kb():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="link_confirm_no")]
     ])
 
+# === ГЛОБАЛЬНЫЕ ДАННЫЕ ===
+search_queue = set()
+active_sessions = {}
+
 # === БЕЗОПАСНОСТЬ ===
 user_command_count = defaultdict(list)
 user_captcha_attempts = defaultdict(int)
@@ -132,7 +139,7 @@ async def ban_user_in_db(user_id: int, hours: int = 4):
         ON CONFLICT (user_id) DO UPDATE
         SET expires_at = $2
     """, user_id, expires)
-    # Также обновим users
+    # Обновим и users
     user = await get_user_from_db(user_id)
     if user:
         await save_user_to_db(user_id, user["own_gender"], user["search_preference"], expires)
@@ -165,15 +172,10 @@ def trigger_captcha(user_id: int):
     random.shuffle(options)
     return correct, options
 
-# === ГЛОБАЛЬНЫЕ ДАННЫЕ (временно для сессий) ===
-search_queue = set()
-active_sessions = {}
-
 # === ОБРАБОТЧИКИ ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    # Проверка бана из БД
     banned_until = await get_ban_from_db(user_id)
     if is_banned(banned_until):
         await message.answer(f"⚠️ Вы забанены. Осталось: {get_ban_time_left(banned_until)}")
@@ -190,8 +192,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(UserState.choosing_own_gender)
     else:
-        # Загружаем данные в память для сессии
-        active_sessions  # не используется здесь, но данные есть
         await message.answer("Выберите действие:", reply_markup=get_idle_kb())
 
 @dp.message(UserState.choosing_own_gender)
@@ -200,8 +200,7 @@ async def choose_own_gender(message: types.Message, state: FSMContext):
         await message.answer("Пожалуйста, выберите из кнопок.")
         return
     own_gender = "male" if message.text == "Мужчина" else "female"
-    users_data = {"own_gender": own_gender}
-    await state.update_data(temp_user=users_data)
+    await state.update_data(temp_user={"own_gender": own_gender})
     await state.set_state(UserState.choosing_search_pref)
     await message.answer("Кого вы хотите найти?", reply_markup=get_search_pref_kb())
 
@@ -379,7 +378,6 @@ async def cmd_next(message: types.Message, state: FSMContext):
         await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
     if user_id in search_queue:
         search_queue.discard(user_id)
-    # Начинаем новый поиск
     await cmd_search(message, state)
 
 @dp.message(Command("link"))
@@ -426,7 +424,6 @@ async def handle_chat(message: types.Message, state: FSMContext):
             await message.answer("Выберите действие:", reply_markup=get_idle_kb())
         return
 
-    # Запрет пересылки — отправляем как новые сообщения
     if message.photo:
         await bot.send_photo(active_sessions[user_id], photo=message.photo[-1].file_id, caption=message.caption, has_spoiler=True)
     elif message.video:
@@ -438,29 +435,17 @@ async def handle_chat(message: types.Message, state: FSMContext):
     else:
         await bot.send_message(active_sessions[user_id], message.text)
 
-    # Пересылка медиа в канал
     if message.photo or message.video or message.voice or message.animation:
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
 
 async def on_startup(bot: Bot):
-    try:
-        print("🔧 DATABASE_URL:", os.getenv("DATABASE_URL", "NOT SET"))
-        await init_db()
-        print("✅ Бот и PostgreSQL готовы!")
-    except Exception as e:
-        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
-        import traceback
-        traceback.print_exc()
-        raise  # чтобы Railway остановил деплой и показал ошибку
+    print("🔧 DATABASE_URL:", DATABASE_URL[:20] + "..." if DATABASE_URL else "NOT SET")
+    await init_db()
+    print("✅ Бот и PostgreSQL успешно запущены!")
 
 async def main():
-    try:
-        dp.startup.register(on_startup)
-        await dp.start_polling(bot)
-    except Exception as e:
-        print(f"💥 ОШИБКА В ГЛАВНОМ ЦИКЛЕ: {e}")
-        import traceback
-        traceback.print_exc()
+    dp.startup.register(on_startup)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
