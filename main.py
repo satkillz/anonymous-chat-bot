@@ -317,7 +317,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
                     if candidate == user_id or candidate in active_sessions:
                         continue
                     candidate_data = await get_user_from_db(candidate)
-                    if not candidate_
+                    if not candidate_data:
                         continue
                     if pref == "any" or candidate_data["own_gender"] == pref:
                         search_queue.discard(user_id)
