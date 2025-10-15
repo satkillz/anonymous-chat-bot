@@ -35,7 +35,7 @@ class UserState(StatesGroup):
     waiting_for_captcha = State()
     in_search = State()
     confirming_link = State()
-    rating_partner = State()  # новое состояние
+    rating_partner = State()
 
 # === КЛАВИАТУРЫ ===
 def get_own_gender_kb():
@@ -90,7 +90,7 @@ def get_rating_kb(partner_id: int):
         [InlineKeyboardButton(text="👎 Неадекват", callback_data=f"rate_{partner_id}_0")]
     ])
 
-# === ГЛОБАЛЬНЫЕ ДАННЫЕ (временно в памяти) ===
+# === ГЛОБАЛЬНЫЕ ДАННЫЕ ===
 search_queue = set()
 active_sessions = {}
 
@@ -386,28 +386,34 @@ async def cmd_stop(message: types.Message, state: FSMContext):
     if partner_id:
         active_sessions.pop(user_id, None)
         active_sessions.pop(partner_id, None)
-        # Отправляем оценку
+        await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
+        # Показываем оценку ТОЛЬКО ушедшему
         await message.answer("Оцените собеседника:", reply_markup=get_rating_kb(partner_id))
         await state.set_state(UserState.rating_partner)
-        await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
+    else:
+        await message.answer("Вы не в чате.", reply_markup=get_idle_kb())
     if user_id in search_queue:
         search_queue.discard(user_id)
     await state.clear()
 
 @dp.message(Command("next"))
 async def cmd_next(message: types.Message, state: FSMContext):
-    await cmd_stop(message, state)  # завершаем текущий чат
+    await cmd_stop(message, state)
     await asyncio.sleep(1)
-    await cmd_search(message, state)  # сразу ищем нового
+    await cmd_search(message, state)
 
 @dp.callback_query(lambda c: c.data.startswith("rate_"))
 async def handle_rating(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
-    _, partner_id_str, rating_str = callback.data.split("_")
-    partner_id = int(partner_id_str)
-    rating = rating_str == "1"
-    await save_rating(user_id, partner_id, rating)
-    await callback.message.edit_text("Спасибо за оценку! ❤️")
+    try:
+        _, partner_id_str, rating_str = callback.data.split("_")
+        partner_id = int(partner_id_str)
+        rating = rating_str == "1"
+        await save_rating(user_id, partner_id, rating)
+        await callback.message.edit_text("Спасибо за оценку! ❤️")
+    except Exception as e:
+        logging.error(f"Rating error: {e}")
+        await callback.message.edit_text("Ошибка оценки.")
     await state.clear()
     await callback.answer()
 
@@ -461,7 +467,7 @@ async def cmd_unban(message: types.Message):
         return
     try:
         user_id = int(message.text.split()[1])
-        await ban_user_in_db(user_id, 0)  # снять бан
+        await ban_user_in_db(user_id, 0)
         await message.answer(f"✅ Бан снят с {user_id}")
     except:
         await message.answer("❌ Используй: /unban <user_id>")
@@ -516,7 +522,6 @@ async def handle_chat(message: types.Message, state: FSMContext):
     else:
         await bot.send_message(partner_id, message.text)
 
-    # Пересылка медиа в канал модерации
     if message.photo or message.video or message.voice or message.animation:
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
 
