@@ -181,7 +181,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
     await state.clear()
     user_data = await get_user_from_db(user_id)
-    if not user_  # ✅ ИСПРАВЛЕНО: user_data + двоеточие
+    if not user_data:  # ✅ ИСПРАВЛЕНО: user_data + двоеточие
         await message.answer(
             "👋 Добро пожаловать в анонимный чат!\n\n"
             "1️⃣ Сначала выберите **ваш пол**\n"
@@ -260,7 +260,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
         return
 
     user_data = await get_user_from_db(user_id)
-    if not user_:  # ✅ ИСПРАВЛЕНО
+    if not user_data:  # ✅ ИСПРАВЛЕНО
         await message.answer("Сначала укажите ваш пол через /start")
         return
     if user_id in active_sessions:
@@ -287,14 +287,14 @@ async def cmd_search(message: types.Message, state: FSMContext):
                 if user_id not in search_queue:
                     return
                 user_data = await get_user_from_db(user_id)
-                if not user_:  # ✅ ИСПРАВЛЕНО
+                if not user_data:  # ✅ ИСПРАВЛЕНО
                     return
                 pref = user_data["search_preference"]
                 for candidate in list(search_queue):
                     if candidate == user_id or candidate in active_sessions:
                         continue
                     candidate_data = await get_user_from_db(candidate)
-                    if not candidate_:  # ✅ ИСПРАВЛЕНО
+                    if not candidate_data:  # ✅ ИСПРАВЛЕНО
                         continue
                     if pref == "any" or candidate_data["own_gender"] == pref:
                         search_queue.discard(user_id)
