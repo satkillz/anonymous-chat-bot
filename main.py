@@ -282,7 +282,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
         return
 
     user_data = await get_user_from_db(user_id)
-    if not user_
+    if not user_data:
         await message.answer("Сначала укажите ваш пол через /start")
         return
     if user_id in active_sessions:
@@ -309,7 +309,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
                 if user_id not in search_queue:
                     return
                 user_data = await get_user_from_db(user_id)
-                if not user_
+                if not user_data:
                     search_queue.discard(user_id)
                     return
                 pref = user_data["search_preference"]
