@@ -18,6 +18,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("MODERATION_CHANNEL_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
 
 if not BOT_TOKEN or not DATABASE_URL:
     raise ValueError("❌ BOT_TOKEN или DATABASE_URL не заданы!")
@@ -34,6 +35,7 @@ class UserState(StatesGroup):
     waiting_for_captcha = State()
     in_search = State()
     confirming_link = State()
+    rating_partner = State()  # новое состояние
 
 # === КЛАВИАТУРЫ ===
 def get_own_gender_kb():
@@ -82,7 +84,13 @@ def get_link_confirm_kb():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="link_confirm_no")]
     ])
 
-# === ГЛОБАЛЬНЫЕ ДАННЫЕ ===
+def get_rating_kb(partner_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👍 Хороший", callback_data=f"rate_{partner_id}_1")],
+        [InlineKeyboardButton(text="👎 Неадекват", callback_data=f"rate_{partner_id}_0")]
+    ])
+
+# === ГЛОБАЛЬНЫЕ ДАННЫЕ (временно в памяти) ===
 search_queue = set()
 active_sessions = {}
 
@@ -97,13 +105,23 @@ async def init_db():
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
-            own_gender TEXT,
-            search_preference TEXT,
+            own_gender TEXT CHECK (own_gender IN ('male', 'female')),
+            search_preference TEXT CHECK (search_preference IN ('male', 'female', 'any')),
             banned_until DOUBLE PRECISION DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS bans (
-            user_id BIGINT PRIMARY KEY,
-            expires_at DOUBLE PRECISION
+        CREATE TABLE IF NOT EXISTS ratings (
+            rater_id BIGINT,
+            rated_id BIGINT,
+            rating BOOLEAN,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (rater_id, rated_id)
+        );
+        CREATE TABLE IF NOT EXISTS reports (
+            reporter_id BIGINT,
+            reported_id BIGINT,
+            message_text TEXT,
+            media_file_id TEXT,
+            reported_at TIMESTAMP DEFAULT NOW()
         );
     """)
     await conn.close()
@@ -125,23 +143,27 @@ async def save_user_to_db(user_id: int, own_gender: str, search_preference: str,
     await conn.close()
 
 async def get_ban_from_db(user_id: int):
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT expires_at FROM bans WHERE user_id = $1", user_id)
-    await conn.close()
-    return row["expires_at"] if row else 0
+    user = await get_user_from_db(user_id)
+    return user["banned_until"] if user else 0
 
 async def ban_user_in_db(user_id: int, hours: int = 4):
     expires = time.time() + hours * 3600
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute("""
-        INSERT INTO bans (user_id, expires_at)
+        INSERT INTO users (user_id, banned_until)
         VALUES ($1, $2)
         ON CONFLICT (user_id) DO UPDATE
-        SET expires_at = $2
+        SET banned_until = $2
     """, user_id, expires)
-    user = await get_user_from_db(user_id)
-    if user:
-        await save_user_to_db(user_id, user["own_gender"], user["search_preference"], expires)
+    await conn.close()
+
+async def save_rating(rater_id: int, rated_id: int, rating: bool):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        INSERT INTO ratings (rater_id, rated_id, rating)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (rater_id, rated_id) DO NOTHING
+    """, rater_id, rated_id, rating)
     await conn.close()
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
@@ -181,7 +203,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
     await state.clear()
     user_data = await get_user_from_db(user_id)
-    if not user_data:  # ✅ ИСПРАВЛЕНО: user_data + двоеточие
+    if not user_data:
         await message.answer(
             "👋 Добро пожаловать в анонимный чат!\n\n"
             "1️⃣ Сначала выберите **ваш пол**\n"
@@ -260,7 +282,7 @@ async def cmd_search(message: types.Message, state: FSMContext):
         return
 
     user_data = await get_user_from_db(user_id)
-    if not user_data:  # ✅ ИСПРАВЛЕНО
+    if not user_
         await message.answer("Сначала укажите ваш пол через /start")
         return
     if user_id in active_sessions:
@@ -287,14 +309,15 @@ async def cmd_search(message: types.Message, state: FSMContext):
                 if user_id not in search_queue:
                     return
                 user_data = await get_user_from_db(user_id)
-                if not user_data:  # ✅ ИСПРАВЛЕНО
+                if not user_
+                    search_queue.discard(user_id)
                     return
                 pref = user_data["search_preference"]
                 for candidate in list(search_queue):
                     if candidate == user_id or candidate in active_sessions:
                         continue
                     candidate_data = await get_user_from_db(candidate)
-                    if not candidate_data:  # ✅ ИСПРАВЛЕНО
+                    if not candidate_
                         continue
                     if pref == "any" or candidate_data["own_gender"] == pref:
                         search_queue.discard(user_id)
@@ -359,25 +382,34 @@ async def handle_captcha(message: types.Message, state: FSMContext):
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    if user_id in active_sessions:
-        partner_id = active_sessions.pop(user_id)
+    partner_id = active_sessions.get(user_id)
+    if partner_id:
+        active_sessions.pop(user_id, None)
         active_sessions.pop(partner_id, None)
+        # Отправляем оценку
+        await message.answer("Оцените собеседника:", reply_markup=get_rating_kb(partner_id))
+        await state.set_state(UserState.rating_partner)
         await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
     if user_id in search_queue:
         search_queue.discard(user_id)
     await state.clear()
-    await message.answer("Поиск остановлен.", reply_markup=get_idle_kb())
 
 @dp.message(Command("next"))
 async def cmd_next(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if user_id in active_sessions:
-        partner_id = active_sessions.pop(user_id)
-        active_sessions.pop(partner_id, None)
-        await bot.send_message(partner_id, "Ваш собеседник покинул чат 😔", reply_markup=get_idle_kb())
-    if user_id in search_queue:
-        search_queue.discard(user_id)
-    await cmd_search(message, state)
+    await cmd_stop(message, state)  # завершаем текущий чат
+    await asyncio.sleep(1)
+    await cmd_search(message, state)  # сразу ищем нового
+
+@dp.callback_query(lambda c: c.data.startswith("rate_"))
+async def handle_rating(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    _, partner_id_str, rating_str = callback.data.split("_")
+    partner_id = int(partner_id_str)
+    rating = rating_str == "1"
+    await save_rating(user_id, partner_id, rating)
+    await callback.message.edit_text("Спасибо за оценку! ❤️")
+    await state.clear()
+    await callback.answer()
 
 @dp.message(Command("link"))
 async def cmd_link(message: types.Message, state: FSMContext):
@@ -407,6 +439,54 @@ async def handle_link_confirm(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
+# === АДМИНКА ===
+@dp.message(Command("ban"))
+async def cmd_ban(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        parts = message.text.split()
+        if len(parts) != 3:
+            raise ValueError
+        user_id = int(parts[1])
+        hours = int(parts[2])
+        await ban_user_in_db(user_id, hours)
+        await message.answer(f"✅ Пользователь {user_id} забанен на {hours}ч")
+    except:
+        await message.answer("❌ Используй: /ban <user_id> <часы>")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        user_id = int(message.text.split()[1])
+        await ban_user_in_db(user_id, 0)  # снять бан
+        await message.answer(f"✅ Бан снят с {user_id}")
+    except:
+        await message.answer("❌ Используй: /unban <user_id>")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    total_users = 0
+    banned = 0
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        banned = await conn.fetchval("SELECT COUNT(*) FROM users WHERE banned_until > $1", time.time())
+        await conn.close()
+    except Exception as e:
+        logging.error(f"Stats error: {e}")
+    await message.answer(
+        f"📊 Статистика:\n"
+        f"Всего пользователей: {total_users}\n"
+        f"Забанено: {banned}\n"
+        f"В поиске: {len(search_queue)}\n"
+        f"В чате: {len(active_sessions) // 2}"
+    )
+
 @dp.message()
 async def handle_chat(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -423,17 +503,20 @@ async def handle_chat(message: types.Message, state: FSMContext):
             await message.answer("Выберите действие:", reply_markup=get_idle_kb())
         return
 
-    if message.photo:
-        await bot.send_photo(active_sessions[user_id], photo=message.photo[-1].file_id, caption=message.caption, has_spoiler=True)
-    elif message.video:
-        await bot.send_video(active_sessions[user_id], video=message.video.file_id, caption=message.caption, has_spoiler=True)
-    elif message.voice:
-        await bot.send_voice(active_sessions[user_id], voice=message.voice.file_id, caption=message.caption, has_spoiler=True)
-    elif message.animation:
-        await bot.send_animation(active_sessions[user_id], animation=message.animation.file_id, caption=message.caption, has_spoiler=True)
-    else:
-        await bot.send_message(active_sessions[user_id], message.text)
+    partner_id = active_sessions[user_id]
 
+    if message.photo:
+        await bot.send_photo(partner_id, photo=message.photo[-1].file_id, caption=message.caption, has_spoiler=True)
+    elif message.video:
+        await bot.send_video(partner_id, video=message.video.file_id, caption=message.caption, has_spoiler=True)
+    elif message.voice:
+        await bot.send_voice(partner_id, voice=message.voice.file_id, caption=message.caption, has_spoiler=True)
+    elif message.animation:
+        await bot.send_animation(partner_id, animation=message.animation.file_id, caption=message.caption, has_spoiler=True)
+    else:
+        await bot.send_message(partner_id, message.text)
+
+    # Пересылка медиа в канал модерации
     if message.photo or message.video or message.voice or message.animation:
         await bot.forward_message(CHANNEL_ID, user_id, message.message_id)
 
